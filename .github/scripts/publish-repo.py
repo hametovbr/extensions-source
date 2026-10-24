@@ -1,327 +1,316 @@
+"""Публикация собранного расширения в персональный репозиторий.
+
+Запуск: `python publish-repo.py <signing-fingerprint> <source-sha>` из чекаута ветки
+`repo` (текущий каталог). Артефакты сборки лежат в `~/apk-artifacts`: каталог на модуль
+с `keiyoushi-source-info.json`, release-APK и подписанным jar.
+
+Что делает:
+  1. загружает APK и jar в GitHub Release с тегом `<модуль>-<версия>`;
+  2. пишет index.json / index.pb / index.min.json / index.html / README.md /
+     repo.json / release-assets.json в текущий каталог;
+  3. удаляет старые релизы, оставляя KEEP_RELEASES последних.
+
+Коммит и push делает workflow — скрипт трогает только рабочее дерево.
+"""
+
 import gzip
 import hashlib
 import html
 import json
-import math
 import sys
-import time
 from pathlib import Path
+
+from google.protobuf import json_format
 
 import index_pb2
 from github_utils import REPO_NAME, run_gh
-from google.protobuf import json_format
 
-# Artifacts downloaded from the build jobs: one APK per extension plus the source metadata JSON
-# emitted by each assembleRelease.
 ARTIFACTS_DIR = Path.home() / "apk-artifacts"
-
-# The checked-out `repo` branch we publish into (the working directory).
 REPO_DIR = Path.cwd()
-
-ICON_BASE_URL = "https://cdn.jsdelivr.net/gh/keiyoushi/extensions-source@main"
-RELEASE_BASE_URL = f"https://github.com/{REPO_NAME}/releases/download"
-ASSET_LIMIT = 495  # Actual limit is 1000 but we upload 2 items per extension.
-UPLOAD_CHUNK_SIZE = 80
-UPLOAD_CHUNK_INTERVAL = 30
-
-to_delete: list[str] = json.loads(sys.argv[1])
-current_sha = sys.argv[2]
-current_sha_short = current_sha[:7]
-# Every extension was rebuilt from scratch: the build output is the source of truth, so
-# nothing is carried over from the published index. This is what drops extensions deleted
-# from the source tree, which a diff against the empty tree can't see.
-full_rebuild = sys.argv[3] == "true"
-
-with REPO_DIR.joinpath("index.json").open() as f:
-    remote_proto = json_format.Parse(f.read(), index_pb2.Index())
-
-remote_extensions = {
-    ext.packageName: ext for ext in remote_proto.extensionList.extensions
-}
-
-release_assets_path = REPO_DIR / "release-assets.json"
-if release_assets_path.exists():
-    with release_assets_path.open() as f:
-        release_assets = json.load(f)
-else:
-    release_assets = {}
-
-updated_release_assets = {
-    package_name: assets
-    for package_name, assets in release_assets.items()
-    if not full_rebuild
-    and not any(package_name.endswith(f".{module}") for module in to_delete)
-}
-
-# Build index entries for the freshly built apks. Each extension's metadata comes from the
-# source-info JSON emitted by its assembleRelease task (see GenerateSourceInfoTask); its APK is a
-# sibling in the same build dir. aapt reads the icon out of the APK
-new_extensions: list[tuple[index_pb2.Extension, Path, Path, bool, bool]] = []
-
+# <repo>/.github/scripts/publish-repo.py → <repo>
 SOURCE_DIR = Path(__file__).resolve().parents[2]
+
+INDEX_NAME = "Hametovbr"
+BADGE_LABEL = "HBR"
+SOURCE_REPO = "hametovbr/extensions-source"
+WEBSITE = f"https://github.com/{REPO_NAME}"
+ICON_BASE_URL = f"https://cdn.jsdelivr.net/gh/{SOURCE_REPO}@main"
 ICON_FILE = "res/mipmap-xhdpi/ic_launcher.png"
+RELEASE_BASE_URL = f"https://github.com/{REPO_NAME}/releases/download"
+KEEP_RELEASES = 2
+
+if len(sys.argv) != 3:
+    sys.exit("usage: publish-repo.py <signing-fingerprint> <source-sha>")
+
+signing_key, source_sha = sys.argv[1], sys.argv[2]
 
 
-def get_icon_url(module: str, theme: str | None) -> str:
+def icon_url(module: str, theme: str | None) -> str:
     module_icon = f"src/{module.replace('.', '/')}/{ICON_FILE}"
-    if (SOURCE_DIR / module_icon).exists():
+    if (SOURCE_DIR / module_icon).is_file():
         return f"{ICON_BASE_URL}/{module_icon}"
 
     if theme:
         theme_icon = f"lib-multisrc/{theme}/{ICON_FILE}"
-        if (SOURCE_DIR / theme_icon).exists():
+        if (SOURCE_DIR / theme_icon).is_file():
             return f"{ICON_BASE_URL}/{theme_icon}"
 
     return f"{ICON_BASE_URL}/core/src/main/{ICON_FILE}"
 
 
-for info_file in ARTIFACTS_DIR.glob("**/keiyoushi-source-info.json"):
-    with info_file.open(encoding="utf-8") as f:
-        info = json.load(f)
-    package_name = info["packageName"]
-    apk = next((info_file.parent / "outputs/apk/release").glob("*.apk"), None)
-    if apk is None:
-        raise FileNotFoundError(
-            f"{package_name}: no release apk found under {info_file.parent}"
+def release_tag(info: dict) -> str:
+    return f"{info['module'].split('.')[-1]}-{info['versionName']}"
+
+
+def release_exists(tag: str) -> bool:
+    try:
+        run_gh("release", "view", tag, "-R", REPO_NAME, "--json", "tagName")
+        return True
+    except RuntimeError:
+        return False
+
+
+def collect_artifacts() -> list[tuple[dict, Path, Path]]:
+    artifacts = []
+    for info_file in sorted(ARTIFACTS_DIR.glob("**/keiyoushi-source-info.json")):
+        info = json.loads(info_file.read_text(encoding="utf-8"))
+        apk = next((info_file.parent / "outputs/apk/release").glob("*.apk"), None)
+        jar = next((info_file.parent / "outputs/jar/release").glob("*.jar"), None)
+        if apk is None or jar is None:
+            sys.exit(f"{info['packageName']}: нет APK или jar в {info_file.parent}")
+        artifacts.append((info, apk, jar))
+    if not artifacts:
+        sys.exit(f"в {ARTIFACTS_DIR} не нашлось ни одного keiyoushi-source-info.json")
+    return artifacts
+
+
+def upload_release(info: dict, apk: Path, jar: Path) -> str:
+    tag = release_tag(info)
+    if not release_exists(tag):
+        run_gh(
+            "release", "create", tag,
+            "-R", REPO_NAME,
+            "--title", f"{info['name']} {info['versionName']}",
+            "--notes", f"{info['name']} {info['versionName']}, коммит {source_sha[:7]}.",
         )
+    run_gh("release", "upload", tag, str(apk), str(jar), "-R", REPO_NAME, "--clobber")
+    print(f"Опубликован релиз {tag}: {apk.name}, {jar.name}")
+    return tag
 
-    jar = next((info_file.parent / "outputs/jar/release").glob("*.jar"), None)
-    if jar is None:
-        raise FileNotFoundError(
-            f"{package_name}: no release jar found under {info_file.parent}"
-        )
 
-    assets = {
-        "apk": {
-            "name": apk.name,
-            "sha256": hashlib.sha256(apk.read_bytes()).hexdigest(),
-        },
-        "jar": {
-            "name": jar.name,
-            "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
-        },
-    }
-    old_assets = release_assets.get(package_name, {})
-    apk_changed = (
-        package_name not in remote_extensions
-        or old_assets.get("apk") != assets["apk"]
+def prune_releases(prefixes: set[str]) -> None:
+    listing = run_gh(
+        "release", "list", "-R", REPO_NAME,
+        "--json", "tagName,createdAt", "--limit", "100",
     )
-    jar_changed = (
-        package_name not in remote_extensions
-        or old_assets.get("jar") != assets["jar"]
-    )
+    releases = [r for r in json.loads(listing or "[]") if r["tagName"].split("-")[0] in prefixes]
+    releases.sort(key=lambda r: r["createdAt"], reverse=True)
+    for stale in releases[KEEP_RELEASES:]:
+        tag = stale["tagName"]
+        run_gh("release", "delete", tag, "-R", REPO_NAME, "--yes", "--cleanup-tag")
+        print(f"Удалён старый релиз {tag}")
 
-    updated_release_assets[package_name] = assets
 
-    ext = index_pb2.Extension(
-        name=info["name"],
-        packageName=package_name,
-        resources=index_pb2.Resources(
-            iconUrl=get_icon_url(info["module"], info.get("theme")),
-        ),
-        extensionLib=info["extensionLib"],
-        versionCode=info["versionCode"],
-        versionName=info["versionName"],
-        contentWarning=info["contentWarning"],
-        sources=[
-            index_pb2.Source(
-                id=int(source["id"]),
-                name=source["name"],
-                language=source["lang"],
-                homeUrl=source["baseUrl"],
-                mirrorUrls=source.get("mirrorUrls", []),
+def build_index(artifacts: list[tuple[dict, Path, Path]]) -> tuple[index_pb2.Index, dict]:
+    extensions = []
+    release_assets = {}
+    for info, apk, jar in artifacts:
+        package_name = info["packageName"]
+        tag = release_tag(info)
+        release_assets[package_name] = {
+            "apk": {
+                "name": apk.name,
+                "sha256": hashlib.sha256(apk.read_bytes()).hexdigest(),
+            },
+            "jar": {
+                "name": jar.name,
+                "sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            },
+        }
+        extensions.append(
+            index_pb2.Extension(
+                name=info["name"],
+                packageName=package_name,
+                resources=index_pb2.Resources(
+                    apkUrl=f"{RELEASE_BASE_URL}/{tag}/{apk.name}",
+                    iconUrl=icon_url(info["module"], info.get("theme")),
+                    jarUrl=f"{RELEASE_BASE_URL}/{tag}/{jar.name}",
+                ),
+                extensionLib=info["extensionLib"],
+                versionCode=info["versionCode"],
+                versionName=info["versionName"],
+                contentWarning=info["contentWarning"],
+                sources=[
+                    index_pb2.Source(
+                        id=int(source["id"]),
+                        name=source["name"],
+                        language=source["lang"],
+                        homeUrl=source["baseUrl"],
+                        mirrorUrls=source.get("mirrorUrls", []),
+                    )
+                    for source in info["sources"]
+                ],
             )
-            for source in info["sources"]
-        ],
-    )
-    new_extensions.append((ext, apk, jar, apk_changed, jar_changed))
-
-new_extensions.sort(key=lambda item: item[0].packageName)
-
-changed_extensions = [item for item in new_extensions if item[3] or item[4]]
-total_changed_extensions = len(changed_extensions)
-release_count = (
-    math.ceil(total_changed_extensions / ASSET_LIMIT)
-    if total_changed_extensions
-    else 0
-)
-ext_per_release = (
-    math.ceil(total_changed_extensions / release_count) if release_count else 0
-)
-
-
-def get_release_tag(batch_index: int) -> str:
-    return (
-        f"{current_sha_short}-{batch_index}" if release_count > 1 else current_sha_short
-    )
-
-
-changed_index = 0
-for ext, apk, jar, apk_changed, jar_changed in new_extensions:
-    if apk_changed or jar_changed:
-        tag = get_release_tag(changed_index // ext_per_release)
-        old_resources = remote_extensions.get(ext.packageName)
-        ext.resources.apkUrl = (
-            f"{RELEASE_BASE_URL}/{tag}/{apk.name}"
-            if apk_changed
-            else old_resources.resources.apkUrl
         )
-        ext.resources.jarUrl = (
-            f"{RELEASE_BASE_URL}/{tag}/{jar.name}"
-            if jar_changed
-            else old_resources.resources.jarUrl
+
+    extensions.sort(key=lambda ext: ext.packageName)
+    index = index_pb2.Index(
+        name=INDEX_NAME,
+        badgeLabel=BADGE_LABEL,
+        signingKey=signing_key,
+        contact=index_pb2.Contact(website=WEBSITE),
+        extensionList=index_pb2.ExtensionList(extensions=extensions),
+    )
+    return index, release_assets
+
+
+def build_legacy_index(artifacts: list[tuple[dict, Path, Path]]) -> list[dict]:
+    """index.min.json старого формата: его читают Suwayomi/Tachiyomi до перехода на index.pb."""
+    legacy = []
+    for info, apk, _ in artifacts:
+        tag = release_tag(info)
+        legacy.append(
+            {
+                "name": info["name"],
+                "pkg": info["packageName"],
+                "apk": apk.name,
+                "lang": info["sources"][0]["lang"] if info["sources"] else "all",
+                "code": info["versionCode"],
+                "version": info["versionName"],
+                "nsfw": 1 if info.get("contentWarning", 0) == 3 else 0,
+                "sources": [
+                    {
+                        "name": source["name"],
+                        "lang": source["lang"],
+                        "id": str(source["id"]),
+                        "baseUrl": source["baseUrl"],
+                    }
+                    for source in info["sources"]
+                ],
+                "apk_url": f"{RELEASE_BASE_URL}/{tag}/{apk.name}",
+            }
         )
-        changed_index += 1
-    else:
-        old_resources = remote_extensions[ext.packageName].resources
-        ext.resources.apkUrl = old_resources.apkUrl
-        ext.resources.jarUrl = old_resources.jarUrl
+    return legacy
 
-# Merge with the already-published index, dropping the deleted/rebuilt modules.
-final_extensions = []
-final_extensions.extend(
-    ext
-    for ext in remote_proto.extensionList.extensions
-    if not full_rebuild
-    and not any(ext.packageName.endswith(f".{module}") for module in to_delete)
-)
-final_extensions.extend(ext for ext, _, _, _, _ in new_extensions)
-final_extensions.sort(key=lambda ext: ext.packageName)
 
-index = index_pb2.Index(
-    name="Keiyoushi",
-    badgeLabel="KEI",
-    signingKey="9add655a78e96c4ec7a53ef89dccb557cb5d767489fac5e785d671a5a75d4da2",
-    contact=index_pb2.Contact(
-        website="https://keiyoushi.github.io",
-        discord="https://discord.gg/3FbCpdKbdY",
-    ),
-    extensionList=index_pb2.ExtensionList(extensions=final_extensions),
-)
+def write_readme(index: index_pb2.Index) -> None:
+    rows = ["| Расширение | Версия | versionCode | Пакет |", "|---|---|---|---|"]
+    for ext in index.extensionList.extensions:
+        rows.append(f"| {ext.name} | {ext.versionName} | {ext.versionCode} | `{ext.packageName}` |")
 
-with REPO_DIR.joinpath("index.json").open("w", encoding="utf-8") as f:
-    f.write(
+    readme = "\n".join(
+        [
+            f"# {REPO_NAME}",
+            "",
+            "Персональный репозиторий расширений для Suwayomi / Mihon.",
+            "",
+            "## URL репозитория",
+            "",
+            "```",
+            f"https://raw.githubusercontent.com/{REPO_NAME}/repo/index.pb",
+            "```",
+            "",
+            "Старый формат (только `index.min.json`):",
+            "",
+            "```",
+            f"https://raw.githubusercontent.com/{REPO_NAME}/repo/index.min.json",
+            "```",
+            "",
+            "## Что внутри",
+            "",
+            *rows,
+            "",
+            f"- Исходники: https://github.com/{SOURCE_REPO}",
+            f"- Отпечаток ключа подписи (signingKey): `{signing_key}`",
+            "- Сборка и публикация — GitHub Actions в репозитории исходников.",
+            "",
+        ]
+    )
+    (REPO_DIR / "README.md").write_text(readme, encoding="utf-8")
+
+
+def write_repo_files(index: index_pb2.Index, release_assets: dict) -> None:
+    (REPO_DIR / "index.json").write_text(
         json_format.MessageToJson(
             index,
             always_print_fields_with_no_presence=False,
             preserving_proto_field_name=True,
-        )
+        ),
+        encoding="utf-8",
+    )
+    (REPO_DIR / "index.pb").write_bytes(
+        gzip.compress(index.SerializeToString(deterministic=True), mtime=0)
     )
 
-with REPO_DIR.joinpath("index.pb").open("wb") as f:
-    f.write(gzip.compress(index.SerializeToString(deterministic=True), mtime=0))
-
-with release_assets_path.open("w", encoding="utf-8") as f:
-    json.dump(updated_release_assets, f, indent=2, sort_keys=True)
-    f.write("\n")
-
-with REPO_DIR.joinpath("index.html").open("w", encoding="utf-8") as f:
-    f.write(
-        '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n<title>apks</title>\n</head>\n<body>\n<pre>\n'
-    )
-    for ext in final_extensions:
-        apk_escaped = html.escape(ext.resources.apkUrl)
-        name_escaped = html.escape(f"Tachiyomi: {ext.name}")
-        f.write(f'<a href="{apk_escaped}">{name_escaped}</a>\n')
-    f.write("</pre>\n</body>\n</html>\n")
-
-# --- Upload assets as release ---
-if not changed_extensions:
-    sys.exit(0)
-
-
-def create_release(tag: str):
-    if run_gh(
-        "release",
-        "view",
-        tag,
-        "--repo",
-        REPO_NAME,
-        "--json",
-        "tagName",
-        success_errors=("release not found",),
-    ):
-        print(f"Release {tag} already exists")
-        return
-
-    print(f"Creating release {tag}")
-    run_gh(
-        "release",
-        "create",
-        tag,
-        "--repo",
-        REPO_NAME,
-        "--draft",
-        "--title",
-        f"Repository Update {tag}",
-        "--notes",
-        f"Automated update from keiyoushi/extensions-source@{current_sha}",
-    )
-
-
-def publish_release(tag: str):
-    print(f"Publishing release {tag}")
-    run_gh("release", "edit", tag, "--repo", REPO_NAME, "--draft=false")
-
-
-def get_release_assets(tag: str) -> dict[str, str]:
-    release = json.loads(
-        run_gh(
-            "release",
-            "view",
-            tag,
-            "--repo",
-            REPO_NAME,
-            "--json",
-            "assets",
-        )
-    )
-    return {
-        asset["name"]: (asset.get("digest") or "").removeprefix("sha256:")
-        for asset in release["assets"]
+    repo_json = {
+        "index_v2": f"https://github.com/{REPO_NAME}/raw/repo/index.pb",
+        "meta": {
+            "name": INDEX_NAME,
+            "website": WEBSITE,
+            "signingKeyFingerprint": signing_key,
+        },
     }
+    (REPO_DIR / "repo.json").write_text(
+        json.dumps(repo_json, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
 
+    (REPO_DIR / "release-assets.json").write_text(
+        json.dumps(release_assets, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
-def upload_assets(tag: str, files: list[Path]):
-    if not files:
-        return
-
-    existing_assets = get_release_assets(tag)
-    files_to_upload = [
-        file
-        for file in files
-        if existing_assets.get(file.name)
-        != hashlib.sha256(file.read_bytes()).hexdigest()
+    lines = [
+        "<!DOCTYPE html>",
+        "<html>",
+        "<head>",
+        '<meta charset="UTF-8">',
+        f"<title>{html.escape(INDEX_NAME)}</title>",
+        "</head>",
+        "<body>",
+        "<pre>",
     ]
-    skipped = len(files) - len(files_to_upload)
-    print(f"Uploading {len(files_to_upload)} assets to {tag}, skipping {skipped}")
-
-    for i in range(0, len(files_to_upload), UPLOAD_CHUNK_SIZE):
-        chunk = files_to_upload[i : i + UPLOAD_CHUNK_SIZE]
-        if i:
-            time.sleep(UPLOAD_CHUNK_INTERVAL)
-        print(f"  assets {i + 1}-{i + len(chunk)} of {len(files_to_upload)}")
-        run_gh(
-            "release",
-            "upload",
-            tag,
-            *[str(f) for f in chunk],
-            "--repo",
-            REPO_NAME,
-            "--clobber",
+    for ext in index.extensionList.extensions:
+        lines.append(
+            f'<a href="{html.escape(ext.resources.apkUrl)}">'
+            f"{html.escape(f'Tachiyomi: {ext.name}')}</a>"
         )
-    publish_release(tag)
+    lines += ["</pre>", "</body>", "</html>", ""]
+    (REPO_DIR / "index.html").write_text("\n".join(lines), encoding="utf-8")
 
 
-for i in range(0, total_changed_extensions, ext_per_release):
-    batch = changed_extensions[i : i + ext_per_release]
-    tag = get_release_tag(i // ext_per_release)
-    files_to_upload = [
-        file
-        for _, apk, jar, apk_changed, jar_changed in batch
-        for file, changed in ((apk, apk_changed), (jar, jar_changed))
-        if changed
-    ]
+def copy_apks(artifacts: list[tuple[dict, Path, Path]]) -> None:
+    # Старый формат репозитория ожидает APK рядом с index.min.json: приложение склеивает
+    # адрес ветки с именем файла. Кладём только текущие сборки, старые убираем.
+    keep = set()
+    for _, apk, _ in artifacts:
+        keep.add(apk.name)
+        (REPO_DIR / apk.name).write_bytes(apk.read_bytes())
 
-    create_release(tag)
-    upload_assets(tag, files_to_upload)
+    for stale in REPO_DIR.glob("*.apk"):
+        if stale.name not in keep:
+            stale.unlink()
+            print(f"Удалён устаревший APK {stale.name}")
+
+
+def main() -> None:
+    artifacts = collect_artifacts()
+    for info, apk, jar in artifacts:
+        upload_release(info, apk, jar)
+
+    index, release_assets = build_index(artifacts)
+    write_repo_files(index, release_assets)
+    write_readme(index)
+    copy_apks(artifacts)
+
+    (REPO_DIR / "index.min.json").write_text(
+        json.dumps(build_legacy_index(artifacts), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    prune_releases({info["module"].split(".")[-1] for info, _, _ in artifacts})
+
+    for ext in index.extensionList.extensions:
+        print(f"Индекс: {ext.name} {ext.versionName} ({ext.versionCode}) → {ext.resources.apkUrl}")
+
+
+if __name__ == "__main__":
+    main()

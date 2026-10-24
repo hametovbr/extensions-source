@@ -1,7 +1,7 @@
 import subprocess
 import time
 
-REPO_NAME = "keiyoushi/extensions"
+REPO_NAME = "hametovbr/extensions"
 RETRY_ATTEMPTS = 4
 RETRY_BASE_DELAY = 60
 

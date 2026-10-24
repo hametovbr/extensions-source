@@ -28,13 +28,7 @@ dependencyResolutionManagement {
 
 enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
 
-rootProject.name = "Keiyoushi"
-
-/**
- * Add or remove modules to load as needed for local development here.
- */
-loadAllIndividualExtensions()
-// loadIndividualExtension("all", "mangadex")
+rootProject.name = "Hametovbr"
 
 /**
  * ===================================== COMMON CONFIGURATION ======================================
@@ -42,25 +36,13 @@ loadAllIndividualExtensions()
 include(":core")
 include(":compiler")
 
-// Load all modules under /lib
-File(rootDir, "lib").eachDir { include("lib:${it.name}") }
-
 // Load all modules under /lib-multisrc
 File(rootDir, "lib-multisrc").eachDir { include("lib-multisrc:${it.name}") }
 
 /**
- * ======================================== HELPER FUNCTION ========================================
+ * ======================================== EXTENSIONS =============================================
  */
-fun loadAllIndividualExtensions() {
-    File(rootDir, "src").eachDir { dir ->
-        dir.eachDir { subdir ->
-            include("src:${dir.name}:${subdir.name}")
-        }
-    }
-}
-fun loadIndividualExtension(lang: String, name: String) {
-    include("src:$lang:$name")
-}
+include(":src:ru:henchan")
 
 fun File.eachDir(block: (File) -> Unit) {
     val files = listFiles() ?: return

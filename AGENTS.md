@@ -1,59 +1,40 @@
 # Agent instructions
 
-Before writing or modifying any extension, multisrc theme, or lib code in this repository, **read
-[CONTRIBUTING.md](CONTRIBUTING.md) in full**. It is the source of truth for conventions here and is
-updated frequently - do not rely on prior knowledge of this codebase or of Tachiyomi/Mihon
-extensions in general, since common patterns have changed.
+Репозиторий — персональный форк `keiyoushi/extensions-source` с одним расширением
+(`src/ru/henchan`) и одной общей темой (`lib-multisrc/multichan`). Апстримная документация
+(`CONTRIBUTING.md`) удалена; правила ниже — то, что из неё остаётся обязательным.
 
-A few points that are easy to get wrong from stale training data:
+## Правила кода расширений
 
-- **Sources must extend `KeiSource`** (`libVersion = "1.6"`), never `HttpSource` directly - the
-  build fails otherwise. See [KeiSource](CONTRIBUTING.md#keisource).
-  - **Metadata is injected via KSP:** Do NOT manually declare or `override val name`, `lang`, `id`, or `baseUrl` in your `@Source` class. These are defined using `source {}` blocks in `build.gradle.kts` and injected automatically.
-- **`SourceFactory` is obsolete:** Do NOT implement `SourceFactory` to create multiple sources. Instead, add multiple `source {}` blocks in the extension's `build.gradle.kts`.
-- **Generated Preferences:** Do NOT write manual `SharedPreferences` logic for base URL mirrors or custom user URLs. Use `baseUrl { mirrors(...) }` or `baseUrl { custom(...) }` inside the `source {}` block in `build.gradle.kts`.
-- **Deeplinks are DSL-driven:** Declare URL intent filters using the `deeplink {}` block in `build.gradle.kts`. Do NOT modify `AndroidManifest.xml` or write manual intent filtering logic.
-- **DTOs must be regular classes:** Do NOT use `data class` for `@Serializable` JSON/Protobuf DTOs (it bloats bytecode). Use a regular `class`, make fields `private` where possible, and only use `@SerialName` when the JSON key differs from the camelCase property name.
-- **No local JSON/Proto instances:** Do NOT create `private val json: Json by injectLazy()`. Use the shared `keiyoushi.utils` helpers like `response.parseAs<T>()`, `toJsonRequestBody()`, or `parseAsProto<T>()`.
-- Use `ext-bootstrap.py` to scaffold new extensions rather than hand-writing the module structure -
-  see [Using ext-bootstrap.py](CONTRIBUTING.md#using-ext-bootstrappy).
-- Prefer the helpers documented under
-  [keiyoushi.utils (core utilities)](CONTRIBUTING.md#keiyoushiutils-core-utilities) (JSON parsing,
-  HTTP requests, date parsing, GraphQL, WebView execution, etc.) over hand-rolled equivalents.
-- Check [Available libs](CONTRIBUTING.md#available-libs) before implementing something from scratch
-  that a `lib/` module may already solve.
-- Don't add excessive or obvious comments explaining what code does; only comment on non-obvious
-  *why* (a workaround, a subtle invariant, a site-specific quirk).
-- Don't over-engineer. No speculative abstractions, config options, or generalization beyond what
-  was asked, and no "just in case" error handling, fallbacks, or validation for scenarios that
-  can't actually happen.
+- **Источники наследуются от `KeiSource`** (`libVersion = "1.6"`), не от `HttpSource` напрямую —
+  иначе сборка падает.
+- **Метаданные внедряются через KSP:** не объявляй `name`, `lang`, `id`, `baseUrl` вручную в
+  `@Source`-классе — они задаются блоками `source {}` в `build.gradle.kts`.
+- **`SourceFactory` устарел:** несколько источников — это несколько блоков `source {}`, а не фабрика.
+- **Сгенерированные настройки:** для зеркал и кастомных URL используй `baseUrl { mirrors(...) }` /
+  `baseUrl { custom(...) }` в `source {}`, а не `SharedPreferences`.
+- **Deeplink — через DSL:** блок `deeplink {}` в `build.gradle.kts`; `AndroidManifest.xml` руками не
+  правится.
+- **DTO без `data class`:** для `@Serializable` JSON/Protobuf — обычный `class`, поля `private`,
+  `@SerialName` только при несовпадении ключа.
+- **Без локальных `Json`/`Proto`:** используй `response.parseAs<T>()`, `toJsonRequestBody()`,
+  `parseAsProto<T>()` из `keiyoushi.utils`.
+- Не пиши очевидных комментариев; комментируй только неочевидное «почему» (обход бага сайта,
+  тонкий инвариант).
+- Не изобретай абстракции «на будущее» и не добавляй обработку сценариев, которых не бывает.
 
-If anything in this file conflicts with `CONTRIBUTING.md`, `CONTRIBUTING.md` wins.
+## Границы изменений
 
-## Scope
+Обычная правка источника — файлы под `src/ru/henchan/` и, при необходимости, тема
+`lib-multisrc/multichan/`. `core/`, `compiler/`, `common/`, `gradle/`, `.github/` — только по
+явному запросу: это инфраструктура сборки и публикации.
 
-For a typical "add/fix a source" task, only change files under `src/` (individual extensions),
-`lib-multisrc/` (multisrc themes), or - in rare cases - `lib/`. Leave `core/`, `compiler/`,
-`common/`, `gradle/`, and other build-logic/infrastructure files alone unless you were explicitly
-asked to change them - that's a different, higher-risk category of work.
-
-## Before committing / opening a PR
-
-Run release lint on every Android module you touched:
+## Перед коммитом
 
 ```bash
-./gradlew :src:en:mysource:lintRelease
+./gradlew :src:ru:henchan:lintRelease
+./gradlew spotlessApply   # форматирование Kotlin и Gradle-скриптов
 ```
 
-Run lint directly on shared modules, for example
-`./gradlew :lib-multisrc:madara:lintRelease` or `./gradlew :lib:myhelper:lintRelease`.
-Linting only an extension that depends on a shared module does not reliably report issues in the
-dependency itself. Apply the same rule to `:core:lintRelease` when explicitly working on `core/`.
-
-## Opening a pull request
-
-If you are an AI agent asked to open a pull request, disclose that at the end of the PR
-description: what you were asked to do, and that the PR was opened by an AI agent. Start that note
-with a 🤖 emoji. This is in addition to, not a substitute for, the "This PR is AI-assisted..."
-checklist item in the [Pull Request checklist](CONTRIBUTING.md#pull-request-checklist) - that box
-still needs to be checked by the human who reviewed your changes.
+Линт темы, если менялась она: `./gradlew :lib-multisrc:multichan:lintRelease`.
+Линт только расширения не сообщает о проблемах в зависимой теме.
