@@ -205,7 +205,7 @@ abstract class HenChan : MultiChan() {
             ?.text()
             ?.substringAfter("Аниме/манга")
             ?.cleanText()
-        val tags = document.select(".sidetags ul a").map { it.cleanText() }
+        val tags = document.parseTags()
         manga.genre = (listOfNotNull(category) + tags)
             .filter { it.isNotEmpty() }
             .distinct()
@@ -223,6 +223,11 @@ abstract class HenChan : MultiChan() {
     private fun String.cleanText() = replace("\uFEFF", "").replace("\u00A0", " ").trim()
 
     private fun Element.cleanText() = text().cleanText()
+
+    // В каждой строке тегов по три ссылки: «+» и «−» для поиска и сам тег последним.
+    private fun Document.parseTags() = select(".sidetags li.sidetag a:last-child")
+        .map { it.cleanText() }
+        .filter { it.isNotEmpty() && it != "+" && it != "-" }
 
     override suspend fun fetchMangaUpdate(
         manga: SManga,
@@ -267,10 +272,7 @@ abstract class HenChan : MultiChan() {
             ?.takeIf { it.isNotEmpty() }
             ?: manga.title
         details.thumbnail_url = related?.selectFirst("img#cover")?.attr("abs:src")?.getHQThumbnail()
-        details.genre = related?.select(".sidetags ul a")
-            ?.map { it.cleanText() }
-            ?.filter { it.isNotEmpty() }
-            ?.joinToString(", ")
+        details.genre = related?.parseTags()?.joinToString(", ")
         return details
     }
 
