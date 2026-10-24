@@ -159,8 +159,11 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
-          pip install --quiet protobuf
-          python -u ../main/.github/scripts/publish-repo.py "${FINGERPRINT}" "${GITHUB_SHA}"
+          # Системный protobuf на раннере старый (4.x) и не содержит runtime_version,
+          # который требует сгенерированный index_pb2.py, — поэтому свой venv.
+          python3 -m venv "${RUNNER_TEMP}/publish-venv"
+          "${RUNNER_TEMP}/publish-venv/bin/pip" install --quiet --upgrade pip protobuf
+          "${RUNNER_TEMP}/publish-venv/bin/python" -u ../main/.github/scripts/publish-repo.py "${FINGERPRINT}" "${GITHUB_SHA}"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
