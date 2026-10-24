@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "HenChan"
-    versionCode = 99
+    versionCode = 100
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
     theme = "multichan"

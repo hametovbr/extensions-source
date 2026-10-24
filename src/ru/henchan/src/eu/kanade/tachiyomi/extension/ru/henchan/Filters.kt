@@ -18,7 +18,9 @@ class OrderBy :
         arrayOf("&n=dateasc" to "", "&n=favasc" to "&n=favdesc", "&n=abcdesc" to "&n=abcasc"),
         arrayOf(
             "manga/new&n=dateasc" to "manga/new",
-            "manga/new&n=favasc" to "mostfavorites&sort=manga",
+            // /mostfavorites на сайте отдаёт заглушку «Технические работы», сортировка по
+            // популярности работает только через параметр n= у списка манги.
+            "manga/new&n=favasc" to "manga/new&n=favdesc",
             "manga/new&n=abcdesc" to "manga/new&n=abcasc",
         ),
     )
