@@ -164,7 +164,7 @@ abstract class HenChan : MultiChan() {
 
     override fun popularMangaFromElement(element: Element): SManga {
         val manga = super.popularMangaFromElement(element)
-        manga.thumbnail_url = element.selectFirst("img")?.attr("abs:src")?.getHQThumbnail()
+        manga.thumbnail_url = element.selectFirst("img")?.imageUrl()?.getHQThumbnail()
         return manga
     }
 
@@ -216,11 +216,20 @@ abstract class HenChan : MultiChan() {
             ?.trim()
             ?.takeIf { it.isNotEmpty() }
 
-        manga.thumbnail_url = document.selectFirst("img#cover")?.attr("abs:src")?.getHQThumbnail()
+        manga.thumbnail_url = document.selectFirst("img#cover")?.imageUrl()?.getHQThumbnail()
         return manga
     }
 
     private fun String.cleanText() = replace("\uFEFF", "").replace("\u00A0", " ").trim()
+
+    /**
+     * `attr("abs:src")` у пустого `src` возвращает не пустую строку, а base URI страницы:
+     * тогда обложкой становится адрес самой карточки, и хост качает HTML вместо картинки.
+     * Поэтому сначала проверяем сырое значение, и только потом разворачиваем его в абсолютный URL.
+     */
+    private fun Element.imageUrl(): String? = attr("src")
+        .takeIf { it.isNotBlank() }
+        ?.let { absUrl("src").ifBlank { it } }
 
     private fun Element.cleanText() = text().cleanText()
 
@@ -254,7 +263,7 @@ abstract class HenChan : MultiChan() {
         val block = thumbsRegex.find(body)?.groupValues?.get(1)
             ?: fullimgRegex.find(body)?.groupValues?.get(1)
             ?: return null
-        return urlRegex.find(block.replace("\\/", "/"))?.value
+        return imageUrlRegex.find(block.replace("\\/", "/"))?.value
     }
 
     // Пока счётчик просмотров лежит, карточку собираем из страниц, которые не задевают
@@ -271,7 +280,7 @@ abstract class HenChan : MultiChan() {
             ?.trim()
             ?.takeIf { it.isNotEmpty() }
             ?: manga.title
-        details.thumbnail_url = related?.selectFirst("img#cover")?.attr("abs:src")?.getHQThumbnail()
+        details.thumbnail_url = related?.selectFirst("img#cover")?.imageUrl()?.getHQThumbnail()
         details.genre = related?.parseTags()?.joinToString(", ")
         return details
     }
@@ -390,6 +399,7 @@ abstract class HenChan : MultiChan() {
         private val fullimgRegex = """["']?fullimg["']?\s*[:=]\s*\[([^]]*)]""".toRegex()
         private val thumbsRegex = """["']?thumbs["']?\s*[:=]\s*\[([^]]*)]""".toRegex()
         private val urlRegex = """https?://[^'"\s\\]+""".toRegex()
+        private val imageUrlRegex = """https?://[^'"\s\\]+\.(?:jpe?g|png|webp|gif)""".toRegex(RegexOption.IGNORE_CASE)
     }
 }
 
