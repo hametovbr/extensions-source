@@ -260,8 +260,10 @@ abstract class HenChan : MultiChan() {
     private suspend fun coverFromReaderPage(mangaUrl: String): String? {
         val url = baseUrl + mangaUrl.replace("/manga/", "/online/")
         val body = orNullOnBrokenPage { fetchText(url) } ?: return null
-        val block = thumbsRegex.find(body)?.groupValues?.get(1)
-            ?: fullimgRegex.find(body)?.groupValues?.get(1)
+        // Полноразмерная страница даёт читаемую обложку, миниатюра — только запасной вариант:
+        // 100x140 в библиотеке выглядит мылом.
+        val block = fullimgRegex.find(body)?.groupValues?.get(1)
+            ?: thumbsRegex.find(body)?.groupValues?.get(1)
             ?: return null
         return imageUrlRegex.find(block.replace("\\/", "/"))?.value
     }
