@@ -1,7 +1,8 @@
-# Сборка единственного расширения (HenChan) и публикация персонального репозитория.
+# Сборка всех расширений репозитория (HenChan, MultiManga) и публикация
+# персонального репозитория.
 #
-# Схема: push в main → сборка с подписью → GitHub Release с APK и jar →
-# ветка `repo` репозитория hametovbr/extensions с index.json/index.pb.
+# Схема: push в main → matrix-сборка с подписью → GitHub Releases с APK и jar →
+# ветка `repo` репозитория hametovbr/extensions с общим index.json/index.pb.
 #
 # Секреты репозитория:
 #   SIGNING_KEY       — keystore (signingkey.jks) в base64, одна строка
@@ -26,18 +27,26 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  MODULE: ":src:ru:henchan"
-  MODULE_DIR: "src/ru/henchan"
   EXTENSIONS_REPO: "hametovbr/extensions"
 
 jobs:
   build:
-    name: Build HenChan
+    name: Build ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    outputs:
-      version: ${{ steps.meta.outputs.version }}
-      fingerprint: ${{ steps.meta.outputs.fingerprint }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - module: ":src:ru:henchan"
+            dir: "src/ru/henchan"
+            name: "HenChan"
+          - module: ":src:ru:multimanga"
+            dir: "src/ru/multimanga"
+            name: "MultiManga"
+    env:
+      MODULE: ${{ matrix.module }}
+      MODULE_DIR: ${{ matrix.dir }}
     steps:
       - name: Checkout main branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -82,28 +91,17 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew "${MODULE}:assembleRelease" "${MODULE}:lintRelease"
 
-      - name: Collect build metadata
-        id: meta
-        env:
-          ALIAS: ${{ secrets.ALIAS }}
-          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+      - name: Show build metadata
         run: |
           set -euo pipefail
           info="${MODULE_DIR}/build/keiyoushi-source-info.json"
           test -f "${info}"
-          version=$(jq -r .versionName "${info}")
-          test -n "${version}"
-          fingerprint=$(keytool -list -v -keystore signingkey.jks -storepass "${KEY_STORE_PASSWORD}" -alias "${ALIAS}" \
-            | sed -n 's/.*SHA256: //p' | tr -d ':' | tr '[:upper:]' '[:lower:]')
-          test -n "${fingerprint}"
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "fingerprint=${fingerprint}" >> "${GITHUB_OUTPUT}"
-          echo "Версия ${version}, отпечаток ${fingerprint}"
+          cat "${info}"
 
       - name: Upload extension artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: extension
+          name: extension-${{ matrix.name }}
           path: |
             **/build/outputs/apk/release/*.apk
             **/build/outputs/jar/release/*.jar
@@ -145,32 +143,46 @@ jobs:
           path: repo
           persist-credentials: true
 
+      - name: Compute signing fingerprint
+        id: fingerprint
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "${SIGNING_KEY}" | base64 -d > "${RUNNER_TEMP}/signingkey.jks"
+          value=$(keytool -list -v -keystore "${RUNNER_TEMP}/signingkey.jks" -storepass "${KEY_STORE_PASSWORD}" -alias "${ALIAS}" \
+            | sed -n 's/.*SHA256: //p' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          test -n "${value}"
+          echo "value=${value}" >> "${GITHUB_OUTPUT}"
+
       - name: Download extension artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: extension
+          pattern: extension-*
+          merge-multiple: true
           path: ~/apk-artifacts
 
       - name: Publish and deploy repo
         working-directory: repo
         env:
           GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
-          FINGERPRINT: ${{ needs.build.outputs.fingerprint }}
-          VERSION: ${{ needs.build.outputs.version }}
+          FINGERPRINT: ${{ steps.fingerprint.outputs.value }}
         run: |
           set -euo pipefail
-          # Системный protobuf на раннере старый (4.x) и не содержит runtime_version,
-          # который требует сгенерированный index_pb2.py, — поэтому свой venv.
           python3 -m venv "${RUNNER_TEMP}/publish-venv"
           "${RUNNER_TEMP}/publish-venv/bin/pip" install --quiet --upgrade pip protobuf
           "${RUNNER_TEMP}/publish-venv/bin/python" -u ../main/.github/scripts/publish-repo.py "${FINGERPRINT}" "${GITHUB_SHA}"
 
+          versions=$(find ~/apk-artifacts -name keiyoushi-source-info.json -print0 \
+            | xargs -0 -I{} jq -r '"\(.name) \(.versionName)"' {} | paste -sd, -)
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git status --short
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
-            git commit -m "Publish HenChan ${VERSION}"
+            git commit -m "Publish ${versions}"
             git push
           else
             echo "Индекс не изменился, коммит не нужен"
