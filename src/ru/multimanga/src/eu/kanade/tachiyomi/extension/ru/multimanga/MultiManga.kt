@@ -274,7 +274,7 @@ abstract class MultiManga : KeiSource() {
         number: Float,
         date: Long,
     ): List<SChapter> {
-        val current = chapterFromTitle(title, number)
+        val current = chapterFromTitle(title, number, chapterLabel(title))
         current.setUrlWithoutDomain(mangaUrl)
         // Дату ставим только текущей записи: за датами остальных пришлось бы идти
         // в каждую карточку, а это N лишних запросов.
@@ -301,7 +301,7 @@ abstract class MultiManga : KeiSource() {
                 val href = element.selectFirst("a.cover")?.absUrl("href")?.takeIf { it.isNotBlank() }
                     ?: element.selectFirst("a")?.absUrl("href")?.takeIf { it.isNotBlank() }
                     ?: return@forEach
-                val chapter = chapterFromTitle(caption, cardNumber)
+                val chapter = chapterFromTitle(caption, cardNumber, chapterLabel(caption))
                 chapter.setUrlWithoutDomain(href)
                 chapters += chapter
             }
@@ -318,11 +318,23 @@ abstract class MultiManga : KeiSource() {
         .replace(WHITESPACE, " ")
         .trim(' ', '.', ',', ':', ';', '-')
 
-    private fun chapterFromTitle(title: String, number: Float): SChapter {
+    private fun chapterFromTitle(title: String, number: Float, name: String = title): SChapter {
         val chapter = SChapter.create()
-        chapter.name = title.ifBlank { "Chapter" }
+        chapter.name = name.ifBlank { "Chapter" }
         chapter.chapter_number = number
         return chapter
+    }
+
+    /**
+     * Короткое имя главы для списка: «глава 4» вместо полного названия записи.
+     * Suwayomi срезает из имени название манги, поэтому у текущей записи полное имя
+     * превращалось в пустую строку, а у остальных частей оставалось длинным.
+     */
+    private fun chapterLabel(title: String): String {
+        val cleaned = title.trimTrailingParentheses()
+        val marker = findChapterMarker(cleaned) ?: return title
+        return cleaned.substring(marker.range.first).trim().trim(*BASE_SEPARATORS).trim()
+            .ifEmpty { title }
     }
 
     private suspend fun readerPages(url: String, document: Document): List<Page> {

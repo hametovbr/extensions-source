@@ -20,11 +20,15 @@ internal const val PAGE_UNAVAILABLE_URL =
 /** Метка запросов картинок: по ней интерсептор отличает их от запросов HTML-страниц. */
 internal object PageImageMarker
 
-/** Сколько помеченных запросов подряд могут упасть по сети, прежде чем глава считается недоступной. */
-private const val NETWORK_ERROR_LIMIT = 3
+/**
+ * Сколько сетевых сбоев подряд считаем признаком полностью недоступного CDN, а не
+ * отдельными битыми страницами. Порог намеренно высокий: в галереях сайта встречаются
+ * серии из нескольких отсутствующих файлов подряд, и глава из-за них рваться не должна.
+ */
+private const val NETWORK_FAILURE_LIMIT = 10
 
 internal class PageImageFallbackInterceptor : Interceptor {
-    private val consecutiveNetworkErrors = AtomicInteger(0)
+    private val consecutiveNetworkFailures = AtomicInteger(0)
 
     @Volatile
     private var cachedPlaceholder: ByteArray? = null
@@ -36,14 +40,16 @@ internal class PageImageFallbackInterceptor : Interceptor {
         val response = try {
             requestImage(chain, request)
         } catch (e: IOException) {
-            // Предохранитель: глава из одних заглушек хуже честной ошибки «CDN недоступен».
-            if (consecutiveNetworkErrors.incrementAndGet() >= NETWORK_ERROR_LIMIT) {
+            // Заглушка вместо обрыва: на сайте встречаются галереи, где несколько страниц
+            // подряд лежат на мёртвом CDN, и глава должна скачаться целиком.
+            if (consecutiveNetworkFailures.incrementAndGet() >= NETWORK_FAILURE_LIMIT) {
                 throw SiteUnavailableException("CDN изображений недоступен — попробуйте позже")
             }
             return placeholderResponse(chain, request)
         }
 
-        consecutiveNetworkErrors.set(0)
+        // Любой пришедший HTTP-ответ означает, что CDN жив: сбрасываем счётчик сетевых сбоев.
+        consecutiveNetworkFailures.set(0)
         if (!response.needsPlaceholder()) return response
 
         val placeholder = try {
