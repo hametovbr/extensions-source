@@ -32,7 +32,14 @@ import java.time.format.DateTimeFormatter
 @Source
 abstract class MultiManga : KeiSource() {
 
-    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = rateLimit(2)
+    // Сайт отдаёт 25 карточек на страницу, а главы — десятки картинок: на общем лимите
+    // 2 запроса/с только чтение 22 страниц занимает минимум 11 секунд. Картинки живут на
+    // отдельном CDN, поэтому для них лимит выше; остальные хосты — как у сайта.
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = rateLimit(6) {
+        it.host.endsWith(IMAGE_HOST_SUFFIX)
+    }
+        .rateLimit(2) { it.host.endsWith(SITE_HOST_SUFFIX) }
+        .rateLimit(2)
         .addInterceptor { chain ->
             try {
                 chain.proceed(chain.request())
@@ -44,6 +51,9 @@ abstract class MultiManga : KeiSource() {
                 throw SiteUnavailableException(networkFailureText(e), e)
             }
         }
+        // Сетевой интерсептор ниже обрывает редирект на уже известный мёртвый хост,
+        // не дожидаясь 30-секундного таймаута; заглушка ставится мгновенно.
+        .addNetworkInterceptor(DeadRedirectInterceptor())
         // Внутри обёртки выше: сетевой сбой заглушка не маскирует, он по-прежнему
         // превращается в понятную причину «сайт недоступен».
         .addInterceptor(PageImageFallbackInterceptor())
@@ -384,6 +394,8 @@ abstract class MultiManga : KeiSource() {
 
         private const val RETRIES = 3
         private const val RETRY_DELAY_MS = 700L
+        private const val IMAGE_HOST_SUFFIX = "imgschan.xyz"
+        private const val SITE_HOST_SUFFIX = "multi-manga.com"
         private const val BROKEN_PAGE_MAX_LENGTH = 2000
         private const val CHAPTER_SEARCH_MAX_PAGES = 3
         private const val MAX_READER_PAGES = 300
