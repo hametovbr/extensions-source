@@ -28,16 +28,22 @@ import java.net.URL
 import java.net.URLEncoder
 import java.net.UnknownHostException
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.TimeUnit
 
 @Source
 abstract class MultiManga : KeiSource() {
 
+    // connectTimeout снижен с 30 с до 8 с: мёртвый CDN-редирект (узнаём мы его только
+    // после первого сбоя) иначе стоит 30 секунд на одну страницу; HTML-запросы при этом
+    // повторяются до трёх раз и от короткого connect-таймаута не страдают.
+    //
     // Сайт отдаёт 25 карточек на страницу, а главы — десятки картинок: на общем лимите
     // 2 запроса/с только чтение 22 страниц занимает минимум 11 секунд. Картинки живут на
     // отдельном CDN, поэтому для них лимит выше; остальные хосты — как у сайта.
-    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = rateLimit(6) {
-        it.host.endsWith(IMAGE_HOST_SUFFIX)
-    }
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = connectTimeout(8, TimeUnit.SECONDS)
+        .rateLimit(6) {
+            it.host.endsWith(IMAGE_HOST_SUFFIX)
+        }
         .rateLimit(2) { it.host.endsWith(SITE_HOST_SUFFIX) }
         .rateLimit(2)
         .addInterceptor { chain ->
@@ -112,11 +118,15 @@ abstract class MultiManga : KeiSource() {
 
         // Запись = одна галерея; «глава N» — часть названия. Если маркера в названии нет,
         // отдаём одну синтетическую главу, иначе собираем части серии поиском по базе.
-        val (base, number) = splitChapterTitle(details.title)
+        val originalTitle = details.title
+        val (base, number) = splitChapterTitle(originalTitle)
         val chapterList = if (base == null || number == null) {
-            listOf(singleChapter(manga.url, details.title, date))
+            listOf(singleChapter(manga.url, originalTitle, date))
         } else {
-            groupedChapters(manga.url, details.title, base, number, date)
+            // В библиотеку сохраняем название серии без «глава N»: у каждой части иначе
+            // получается своя запись с длинным названием конкретной главы.
+            details.title = base
+            groupedChapters(manga.url, originalTitle, base, number, date)
         }
 
         return SMangaUpdate(details, chapterList)
