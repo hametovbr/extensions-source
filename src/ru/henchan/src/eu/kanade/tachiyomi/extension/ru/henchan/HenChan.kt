@@ -15,7 +15,10 @@ import keiyoushi.utils.firstInstanceOrNull
 import kotlinx.coroutines.delay
 import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.IOException
@@ -126,6 +129,20 @@ abstract class HenChan : MultiChan() {
                 throw SiteUnavailableException(networkFailureText(e), e)
             }
         }
+        // Внутри обёртки выше: сетевой сбой заглушка не маскирует, он по-прежнему
+        // превращается в понятную причину «сайт недоступен».
+        .addInterceptor(PageImageFallbackInterceptor())
+
+    /**
+     * Сайт отдаёт список страниц пачкой URL, и часть из них потом не скачивается: 404,
+     * 5xx или HTML-заглушка с кодом 200. Клиент видит только ответ картинки, поэтому
+     * помечаем такие запросы — интерсептор подменит битый ответ изображением-заглушкой,
+     * и глава скачается целиком.
+     */
+    override fun imageRequest(page: Page): Request = super.imageRequest(page)
+        .newBuilder()
+        .tag(PageImageMarker::class.java, PageImageMarker)
+        .build()
 
     private fun networkFailureText(error: IOException): String {
         val host = URL(baseUrl).host
@@ -407,3 +424,62 @@ abstract class HenChan : MultiChan() {
 
 /** Сайт недоступен целиком: сеть, DNS, таймаут или сброс соединения. */
 class SiteUnavailableException(message: String, cause: Throwable? = null) : IOException(message, cause)
+
+/**
+ * Страница, которую сайт больше не отдаёт, не должна обрывать загрузку всей главы:
+ * вместо неё клиент получает это изображение. Файл лежит в исходниках расширения
+ * и отдаётся через CDN, потому что клиент скачивает картинку по обычному URL.
+ */
+private const val PAGE_UNAVAILABLE_URL =
+    "https://cdn.jsdelivr.net/gh/hametovbr/extensions-source@main/assets/page-unavailable.png"
+
+/** Метка запросов картинок: по ней интерсептор отличает их от запросов HTML. */
+private object PageImageMarker
+
+private class PageImageFallbackInterceptor : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        if (request.tag(PageImageMarker::class.java) == null) return chain.proceed(request)
+
+        val response = chain.proceed(request)
+        if (!response.needsPlaceholder()) return response
+
+        // Сетевые сбои не глотаем: они должны дойти до обёртки в configureClient
+        // и превратиться в «сайт недоступен», а не в главу из заглушек.
+        val placeholder =
+            try {
+                chain.proceed(
+                    Request.Builder()
+                        .url(PAGE_UNAVAILABLE_URL)
+                        .header("Accept", "image/*")
+                        .build(),
+                )
+            } catch (e: IOException) {
+                response.close()
+                throw e
+            }
+
+        if (placeholder.isImage()) {
+            response.close()
+            return placeholder
+        }
+
+        // Заглушка тоже не пришла — отдаём исходный ответ, чтобы клиент показал причину.
+        placeholder.close()
+        return response
+    }
+}
+
+private fun Response.needsPlaceholder(): Boolean = when {
+    // Это не «страницы нет»: нужен вход или сайт просит сбавить темп.
+    // Такие ответы должны дойти до пользователя как есть, а не стать заглушками.
+    code == 401 || code == 403 || code == 429 -> false
+    isSuccessful -> !isImage()
+    else -> true
+}
+
+private fun Response.isImage(): Boolean {
+    if (!isSuccessful || body.contentLength() == 0L) return false
+    val type = body.contentType() ?: return false
+    return type.type == "image" || (type.type == "application" && type.subtype == "octet-stream")
+}
