@@ -43,6 +43,7 @@ File(rootDir, "lib-multisrc").eachDir { include("lib-multisrc:${it.name}") }
  * ======================================== EXTENSIONS =============================================
  */
 include(":src:ru:henchan")
+include(":src:ru:multimanga")
 
 fun File.eachDir(block: (File) -> Unit) {
     val files = listFiles() ?: return
