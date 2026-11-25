@@ -12,13 +12,12 @@ import keiyoushi.network.get
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.firstInstanceOrNull
+import keiyoushi.utils.tryParseDateTime
 import kotlinx.coroutines.delay
 import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.IOException
@@ -27,6 +26,8 @@ import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.UnknownHostException
+import java.time.format.DateTimeFormatter
+import java.util.concurrent.TimeUnit
 
 @Source
 abstract class HenChan : MultiChan() {
@@ -79,6 +80,7 @@ abstract class HenChan : MultiChan() {
      */
     private suspend fun fetchText(url: String): String {
         var lastWasMysqlError = false
+        var lastWasMaintenance = false
         repeat(RETRIES) { attempt ->
             val body = try {
                 client.get(url, headersBuilder().add("Accept", "image/webp,image/apng").build(), ensureSuccess = false)
@@ -98,16 +100,17 @@ abstract class HenChan : MultiChan() {
                 !body.isBrokenPage() -> return body
                 else -> {
                     lastWasMysqlError = body.isMysqlError()
+                    lastWasMaintenance = body.isMaintenance()
                     if (attempt < RETRIES - 1) delay(RETRY_DELAY_MS * (attempt + 1))
                 }
             }
         }
 
         throw IOException(
-            if (lastWasMysqlError) {
-                "Сайт отдаёт MySQL-ошибку счётчика просмотров, попробуйте позже"
-            } else {
-                "Сайт вернул пустую страницу"
+            when {
+                lastWasMysqlError -> "Сайт отдаёт MySQL-ошибку счётчика просмотров, попробуйте позже"
+                lastWasMaintenance -> "Сайт на техническом обслуживании, попробуйте позже"
+                else -> "Сайт вернул пустую страницу"
             },
         )
     }
@@ -117,7 +120,13 @@ abstract class HenChan : MultiChan() {
      * видеть причину, а не `Connection reset`. Внешний сервис проверки доступности здесь
      * не подходит: downforeveryoneorjustme.com рендерит вердикт на клиенте и API не отдаёт.
      */
-    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = rateLimit(2)
+    // Таймауты и раздельный rate limit выровнены с MultiManga: мёртвый CDN-редирект
+    // висит на TLS/чтении, поэтому connect 8 с и read 10 с; картинки сайта живут на
+    // *.imgschan.xyz, им можно чаще, чем HTML-страницам.
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .rateLimit(6) { it.host.endsWith(IMAGE_HOST_SUFFIX) }
+        .rateLimit(2)
         .addInterceptor { chain ->
             try {
                 chain.proceed(chain.request())
@@ -129,8 +138,9 @@ abstract class HenChan : MultiChan() {
                 throw SiteUnavailableException(networkFailureText(e), e)
             }
         }
-        // Внутри обёртки выше: сетевой сбой заглушка не маскирует, он по-прежнему
-        // превращается в понятную причину «сайт недоступен».
+        // Network-интерсептор обрывает редирект на уже известный мёртвый хост, не дожидаясь
+        // таймаута; заглушка внутри обёртки выше подменяет и HTTP-ошибки, и сетевые сбои.
+        .addNetworkInterceptor(DeadRedirectInterceptor())
         .addInterceptor(PageImageFallbackInterceptor())
 
     /**
@@ -167,7 +177,9 @@ abstract class HenChan : MultiChan() {
 
     private fun String.isAccessDenied() = length < DENIED_PAGE_MAX_LENGTH && contains("404 not found")
 
-    private fun String.isBrokenPage() = length < BROKEN_PAGE_MAX_LENGTH || isMysqlError()
+    private fun String.isMaintenance() = contains("Технические работы", ignoreCase = true) || contains("technical maintenance", ignoreCase = true)
+
+    private fun String.isBrokenPage() = length < BROKEN_PAGE_MAX_LENGTH || isMysqlError() || isMaintenance()
 
     private fun String.getHQThumbnail(): String {
         val isExHenManga = contains("/manganew_thumbs_blur/")
@@ -193,7 +205,7 @@ abstract class HenChan : MultiChan() {
             .body
             .string()
 
-        if (body.isBrokenPage() || body.isAccessDenied() || body.contains("Технические работы")) {
+        if (body.isBrokenPage() || body.isAccessDenied()) {
             return mangasPage("$baseUrl/manga/newest?offset=$offset")
         }
 
@@ -264,6 +276,7 @@ abstract class HenChan : MultiChan() {
         val detailsPage = orNullOnBrokenPage { fetchText(baseUrl + manga.url).asJsoup(baseUrl) }
 
         val details = detailsPage?.let { mangaDetailsParse(it) } ?: mangaDetailsFallback(manga)
+        details.url = manga.url
 
         // У части тайтлов сайт отдаёт карточку с пустым src у обложки, тогда берём первую
         // миниатюру со страницы чтения — она есть всегда, когда есть страницы.
@@ -271,7 +284,13 @@ abstract class HenChan : MultiChan() {
             details.thumbnail_url = coverFromReaderPage(manga.url)
         }
 
-        return SMangaUpdate(details, fetchChapterList(manga, detailsPage ?: Document(baseUrl)))
+        val chapterList = fetchChapterList(details, detailsPage ?: Document(baseUrl))
+
+        // Эталон поведения — MultiManga: у части серии в библиотеке хранится название
+        // серии без «глава N», а имя главы — суффикс маркера.
+        ChapterTitles.parse(details.title).base?.let { details.title = it }
+
+        return SMangaUpdate(details, chapterList)
     }
 
     private suspend fun coverFromReaderPage(mangaUrl: String): String? {
@@ -312,15 +331,13 @@ abstract class HenChan : MultiChan() {
         val relatedUrl = baseUrl + manga.url.replace("/manga/", "/related/")
         val body = orNullOnBrokenPage { fetchText(relatedUrl) } ?: return listOf(manga.singleChapter())
 
-        return chapterListParse(body.asJsoup(relatedUrl), manga)
+        return chapterListParse(body.asJsoup(relatedUrl), manga, mangaPage)
     }
 
     override fun chapterListSelector() = ".related"
 
-    private suspend fun chapterListParse(document: Document, manga: SManga): List<SChapter> {
-        val related = document.select(chapterListSelector())
-            .map { chapterFromElement(it) }
-            .toMutableList()
+    private suspend fun chapterListParse(document: Document, manga: SManga, currentPage: Document?): List<SChapter> {
+        val related = relatedEntries(document).toMutableList()
 
         var nextElement = document.selectFirst("div#pagination_related a:contains(Вперед)")
         while (nextElement != null) {
@@ -328,45 +345,42 @@ abstract class HenChan : MultiChan() {
             if (url.isEmpty()) break
 
             val nextPage = fetchText(url).asJsoup(url)
-            related.addAll(
-                nextPage.select(chapterListSelector()).map { chapterFromElement(it) },
-            )
+            related.addAll(relatedEntries(nextPage))
 
             nextElement = nextPage.selectFirst("div#pagination_related a:contains(Вперед)")
         }
 
         // Вкладка «Похожая манга» — это другие работы, а не главы. Главами они являются
         // только у сериалов, где каждая часть заведена отдельной записью с тем же названием.
-        val series = manga.title.seriesBase()
+        val series = ChapterTitles.parse(manga.title).base?.let(ChapterTitles::normalizeBase)
         val chapters = if (series == null) {
             emptyList()
         } else {
-            related.filter { it.name.seriesBase() == series }
+            related
+                .filter { (_, fullTitle) ->
+                    ChapterTitles.parse(fullTitle).base?.let(ChapterTitles::normalizeBase) == series
+                }
+                .map { (chapter, _) -> chapter }
         }
 
-        return (chapters + manga.singleChapter())
+        return (chapters + manga.singleChapter(currentPage))
             .distinctBy { it.url }
             .sortedBy { it.chapter_number }
     }
 
-    private fun String.seriesBase(): String? = seriesMarkerRegex.find(this)
-        ?.groupValues
-        ?.get(1)
-        ?.trim()
-        ?.lowercase()
-        ?.takeIf { it.isNotEmpty() }
+    // Полное название нужно для сравнения серий, а в имя главы кладём короткий суффикс.
+    private fun relatedEntries(document: Document): List<Pair<SChapter, String>> = document.select(chapterListSelector()).map { element ->
+        val fullTitle = element.selectFirst("h2 a")?.attr("title").orEmpty()
+        chapterFromElement(element) to fullTitle
+    }
 
     private fun SManga.singleChapter(page: Document? = null): SChapter {
         val chapter = SChapter.create()
         chapter.setUrlWithoutDomain(url)
-        val number = chapterNumberRegex.find(title)?.groupValues?.get(2)?.toFloatOrNull()
-        chapter.name = page?.selectFirst("a.title_top_a")
-            ?.text()
-            ?.takeIf { it.isNotBlank() }
-            ?: if (number != null) title else "Chapter"
-        chapter.chapter_number = number
-            ?: chapterNumberRegex.find(chapter.name)?.groupValues?.get(2)?.toFloatOrNull()
-            ?: 1F
+        val parts = ChapterTitles.parse(title)
+        chapter.name = parts.label ?: "Chapter"
+        chapter.chapter_number = parts.number ?: 1F
+        chapter.date_upload = page?.let { chapterDate(it) } ?: 0L
         return chapter
     }
 
@@ -374,11 +388,18 @@ abstract class HenChan : MultiChan() {
         val chapter = SChapter.create()
         val aElement = element.selectFirst("h2 a")
         chapter.setUrlWithoutDomain(aElement?.attr("abs:href") ?: "")
-        val chapterName = aElement?.attr("title") ?: ""
-        chapter.name = chapterName
-        chapter.chapter_number = chapterNumberRegex.find(chapterName)?.groupValues?.get(2)?.toFloat() ?: -1F
+        val fullTitle = aElement?.attr("title") ?: ""
+        val parts = ChapterTitles.parse(fullTitle)
+        chapter.name = parts.label ?: fullTitle
+        chapter.chapter_number = parts.number ?: -1F
         return chapter
     }
+
+    private fun chapterDate(document: Document): Long = document.selectFirst("time[datetime]")
+        ?.attr("datetime")
+        ?.trim()
+        ?.let { DATE_FORMAT.tryParseDateTime(it) }
+        ?: 0L
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val url = if (chapter.url.contains("/manga/")) {
@@ -412,9 +433,10 @@ abstract class HenChan : MultiChan() {
         private const val BROKEN_PAGE_MAX_LENGTH = 2000
         private const val DENIED_PAGE_MAX_LENGTH = 200
 
+        private const val IMAGE_HOST_SUFFIX = "imgschan.xyz"
+
+        private val DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
         private val manganewThumbsRegex = "(?<=/)manganew_thumbs\\w*?(?=/)".toRegex(RegexOption.IGNORE_CASE)
-        private val chapterNumberRegex = "(глава\\s|часть\\s)([0-9]+\\.?[0-9]*)".toRegex(RegexOption.IGNORE_CASE)
-        private val seriesMarkerRegex = """^(.*?)\s*-\s*(?:глава|часть)\s+[0-9]""".toRegex(RegexOption.IGNORE_CASE)
         private val fullimgRegex = """["']?fullimg["']?\s*[:=]\s*\[([^]]*)]""".toRegex()
         private val thumbsRegex = """["']?thumbs["']?\s*[:=]\s*\[([^]]*)]""".toRegex()
         private val urlRegex = """https?://[^'"\s\\]+""".toRegex()
@@ -424,62 +446,3 @@ abstract class HenChan : MultiChan() {
 
 /** Сайт недоступен целиком: сеть, DNS, таймаут или сброс соединения. */
 class SiteUnavailableException(message: String, cause: Throwable? = null) : IOException(message, cause)
-
-/**
- * Страница, которую сайт больше не отдаёт, не должна обрывать загрузку всей главы:
- * вместо неё клиент получает это изображение. Файл лежит в исходниках расширения
- * и отдаётся через CDN, потому что клиент скачивает картинку по обычному URL.
- */
-private const val PAGE_UNAVAILABLE_URL =
-    "https://cdn.jsdelivr.net/gh/hametovbr/extensions-source@main/assets/page-unavailable.png"
-
-/** Метка запросов картинок: по ней интерсептор отличает их от запросов HTML. */
-private object PageImageMarker
-
-private class PageImageFallbackInterceptor : Interceptor {
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-        if (request.tag(PageImageMarker::class.java) == null) return chain.proceed(request)
-
-        val response = chain.proceed(request)
-        if (!response.needsPlaceholder()) return response
-
-        // Сетевые сбои не глотаем: они должны дойти до обёртки в configureClient
-        // и превратиться в «сайт недоступен», а не в главу из заглушек.
-        val placeholder =
-            try {
-                chain.proceed(
-                    Request.Builder()
-                        .url(PAGE_UNAVAILABLE_URL)
-                        .header("Accept", "image/*")
-                        .build(),
-                )
-            } catch (e: IOException) {
-                response.close()
-                throw e
-            }
-
-        if (placeholder.isImage()) {
-            response.close()
-            return placeholder
-        }
-
-        // Заглушка тоже не пришла — отдаём исходный ответ, чтобы клиент показал причину.
-        placeholder.close()
-        return response
-    }
-}
-
-private fun Response.needsPlaceholder(): Boolean = when {
-    // Это не «страницы нет»: нужен вход или сайт просит сбавить темп.
-    // Такие ответы должны дойти до пользователя как есть, а не стать заглушками.
-    code == 401 || code == 403 || code == 429 -> false
-    isSuccessful -> !isImage()
-    else -> true
-}
-
-private fun Response.isImage(): Boolean {
-    if (!isSuccessful || body.contentLength() == 0L) return false
-    val type = body.contentType() ?: return false
-    return type.type == "image" || (type.type == "application" && type.subtype == "octet-stream")
-}

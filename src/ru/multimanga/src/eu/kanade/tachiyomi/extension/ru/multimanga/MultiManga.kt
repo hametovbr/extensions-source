@@ -118,17 +118,23 @@ abstract class MultiManga : KeiSource() {
         details.url = manga.url
         val date = chapterDate(document)
 
+        // Если обложки на карточке нет, берём первую миниатюру страницы или картинку читалки.
+        if (details.thumbnail_url.isNullOrBlank()) {
+            details.thumbnail_url = document.selectFirst("#thumbnail-container .gallerythumb img")?.lazyImageUrl()
+                ?: readerCover(manga.url)
+        }
+
         // Запись = одна галерея; «глава N» — часть названия. Если маркера в названии нет,
         // отдаём одну синтетическую главу, иначе собираем части серии поиском по базе.
         val originalTitle = details.title
-        val (base, number) = splitChapterTitle(originalTitle)
-        val chapterList = if (base == null || number == null) {
+        val parts = parseChapterTitle(originalTitle)
+        val chapterList = if (parts.base == null || parts.number == null) {
             listOf(singleChapter(manga.url, originalTitle, date))
         } else {
             // В библиотеку сохраняем название серии без «глава N»: у каждой части иначе
             // получается своя запись с длинным названием конкретной главы.
-            details.title = base
-            groupedChapters(manga.url, originalTitle, base, number, date)
+            details.title = parts.base
+            groupedChapters(manga.url, originalTitle, parts.base, parts.number, date)
         }
 
         return SMangaUpdate(details, chapterList)
@@ -159,6 +165,7 @@ abstract class MultiManga : KeiSource() {
      */
     private suspend fun fetchText(url: String): String {
         var lastWasMysqlError = false
+        var lastWasMaintenance = false
         repeat(RETRIES) { attempt ->
             val body = try {
                 client.get(url, headers, ensureSuccess = false).body.string()
@@ -171,16 +178,20 @@ abstract class MultiManga : KeiSource() {
                 return@repeat
             }
 
+            if (body.isDeniedPage()) {
+                throw IOException("Нужна авторизация: войдите на multi-manga.com через WebView и повторите")
+            }
             if (!body.isBrokenPage()) return body
             lastWasMysqlError = body.isMysqlError()
+            lastWasMaintenance = body.isMaintenance()
             if (attempt < RETRIES - 1) delay(RETRY_DELAY_MS * (attempt + 1))
         }
 
         throw SiteUnavailableException(
-            if (lastWasMysqlError) {
-                "Сайт отдаёт ошибку базы данных, попробуйте позже"
-            } else {
-                "Сайт вернул пустую страницу"
+            when {
+                lastWasMysqlError -> "Сайт отдаёт ошибку базы данных, попробуйте позже"
+                lastWasMaintenance -> "Сайт на техническом обслуживании, попробуйте позже"
+                else -> "Сайт вернул пустую страницу"
             },
         )
     }
@@ -250,16 +261,15 @@ abstract class MultiManga : KeiSource() {
         ?.let { DATE_FORMAT.tryParseDateTime(it) }
         ?: 0L
 
-    private fun splitChapterTitle(title: String): Pair<String?, Float?> {
+    private fun parseChapterTitle(title: String): ChapterTitleParts {
         val cleaned = title.trimTrailingParentheses()
-        val marker = findChapterMarker(cleaned) ?: return null to null
-        val number = marker.groupValues[1].toFloatOrNull() ?: return null to null
-        val base = cleaned.substring(0, marker.range.first)
-            .trim()
-            .trim(*BASE_SEPARATORS)
-            .trim()
-        if (base.isEmpty()) return null to null
-        return base to number
+        val marker = findChapterMarker(cleaned) ?: return ChapterTitleParts(null, null, null)
+        val number = marker.groupValues[1].toFloatOrNull() ?: return ChapterTitleParts(null, null, null)
+        // База может быть пустой («- глава 2»): группировать нечего, но имя и номер
+        // главы всё равно нужны одиночной записи.
+        val base = cleaned.substring(0, marker.range.first).trim(*BASE_SEPARATORS).ifEmpty { null }
+        val label = cleaned.substring(marker.range.first).trim(*LABEL_SEPARATORS).ifEmpty { null }
+        return ChapterTitleParts(base, number, label)
     }
 
     private fun findChapterMarker(title: String): MatchResult? {
@@ -283,7 +293,8 @@ abstract class MultiManga : KeiSource() {
     }
 
     private fun singleChapter(mangaUrl: String, title: String, date: Long): SChapter {
-        val chapter = chapterFromTitle(title, 1F)
+        val parts = parseChapterTitle(title)
+        val chapter = chapterFromTitle(title, parts.number ?: 1F, parts.label ?: "Chapter")
         chapter.setUrlWithoutDomain(mangaUrl)
         chapter.date_upload = date
         return chapter
@@ -296,7 +307,7 @@ abstract class MultiManga : KeiSource() {
         number: Float,
         date: Long,
     ): List<SChapter> {
-        val current = chapterFromTitle(title, number, chapterLabel(title))
+        val current = chapterFromTitle(title, number, parseChapterTitle(title).label ?: title)
         current.setUrlWithoutDomain(mangaUrl)
         // Дату ставим только текущей записи: за датами остальных пришлось бы идти
         // в каждую карточку, а это N лишних запросов.
@@ -316,14 +327,14 @@ abstract class MultiManga : KeiSource() {
         while (true) {
             document.select(CARD_SELECTOR).forEach { element ->
                 val caption = cardTitle(element)
-                val (cardBase, cardNumber) = splitChapterTitle(caption)
-                if (cardBase == null || cardNumber == null || normalizeBase(cardBase) != normalizedBase) {
+                val parts = parseChapterTitle(caption)
+                if (parts.base == null || parts.number == null || normalizeBase(parts.base) != normalizedBase) {
                     return@forEach
                 }
                 val href = element.selectFirst("a.cover")?.absUrl("href")?.takeIf { it.isNotBlank() }
                     ?: element.selectFirst("a")?.absUrl("href")?.takeIf { it.isNotBlank() }
                     ?: return@forEach
-                val chapter = chapterFromTitle(caption, cardNumber, chapterLabel(caption))
+                val chapter = chapterFromTitle(caption, parts.number, parts.label ?: caption)
                 chapter.setUrlWithoutDomain(href)
                 chapters += chapter
             }
@@ -347,16 +358,12 @@ abstract class MultiManga : KeiSource() {
         return chapter
     }
 
-    /**
-     * Короткое имя главы для списка: «глава 4» вместо полного названия записи.
-     * Suwayomi срезает из имени название манги, поэтому у текущей записи полное имя
-     * превращалось в пустую строку, а у остальных частей оставалось длинным.
-     */
-    private fun chapterLabel(title: String): String {
-        val cleaned = title.trimTrailingParentheses()
-        val marker = findChapterMarker(cleaned) ?: return title
-        return cleaned.substring(marker.range.first).trim().trim(*BASE_SEPARATORS).trim()
-            .ifEmpty { title }
+    private suspend fun readerCover(mangaUrl: String): String? = try {
+        fetchDocument("$baseUrl$mangaUrl/1/")
+            .selectFirst("#image-container img")
+            ?.lazyImageUrl()
+    } catch (e: IOException) {
+        null
     }
 
     private suspend fun readerPages(url: String, document: Document): List<Page> {
@@ -397,7 +404,11 @@ abstract class MultiManga : KeiSource() {
 
     private fun String.isMysqlError() = contains("MySQL Error") || contains("Error Number: 1114")
 
-    private fun String.isBrokenPage() = length < BROKEN_PAGE_MAX_LENGTH || isMysqlError()
+    private fun String.isDeniedPage() = length < DENIED_PAGE_MAX_LENGTH && contains("404 not found")
+
+    private fun String.isMaintenance() = contains("Технические работы", ignoreCase = true) || contains("technical maintenance", ignoreCase = true)
+
+    private fun String.isBrokenPage() = length < BROKEN_PAGE_MAX_LENGTH || isMysqlError() || isMaintenance()
 
     companion object {
         private const val CARD_SELECTOR = "#dle-content div.gallery"
@@ -409,10 +420,12 @@ abstract class MultiManga : KeiSource() {
         private const val IMAGE_HOST_SUFFIX = "imgschan.xyz"
         private const val SITE_HOST_SUFFIX = "multi-manga.com"
         private const val BROKEN_PAGE_MAX_LENGTH = 2000
+        private const val DENIED_PAGE_MAX_LENGTH = 200
         private const val CHAPTER_SEARCH_MAX_PAGES = 3
         private const val MAX_READER_PAGES = 300
 
         private val BASE_SEPARATORS = " -–—:|".toCharArray()
+        private val LABEL_SEPARATORS = " -–—:|.,;".toCharArray()
 
         private val DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
         private val CHAPTER_MARKER_RU =
@@ -423,6 +436,12 @@ abstract class MultiManga : KeiSource() {
         private val PAGE_COUNT = """(\d+)\s*страниц""".toRegex()
     }
 }
+
+private data class ChapterTitleParts(
+    val base: String?,
+    val number: Float?,
+    val label: String?,
+)
 
 /** Сайт недоступен целиком: сеть, DNS, таймаут или сброс соединения. */
 class SiteUnavailableException(message: String, cause: Throwable? = null) : IOException(message, cause)

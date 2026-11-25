@@ -79,7 +79,7 @@ assets/                  изображения, которые расширен
 https://cdn.jsdelivr.net/gh/hametovbr/extensions-source@main/assets/page-unavailable.png
 ```
 
-Логика подмены — `PageImageFallbackInterceptor` в `src/ru/henchan/.../HenChan.kt`.
+Логика подмены — `PageImageFallbackInterceptor` в `src/ru/henchan/.../PageImageFallback.kt`.
 Ответы 401/403/429 и сетевые сбои не подменяются: они должны дойти до пользователя
 как причина, а не превратиться в главу из заглушек.
 
