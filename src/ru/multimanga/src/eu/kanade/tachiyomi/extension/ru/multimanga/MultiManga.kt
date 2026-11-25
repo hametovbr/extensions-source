@@ -127,7 +127,7 @@ abstract class MultiManga : KeiSource() {
         // Запись = одна галерея; «глава N» — часть названия. Если маркера в названии нет,
         // отдаём одну синтетическую главу, иначе собираем части серии поиском по базе.
         val originalTitle = details.title
-        val parts = parseChapterTitle(originalTitle)
+        val parts = ChapterTitles.parse(originalTitle)
         val chapterList = if (parts.base == null || parts.number == null) {
             listOf(singleChapter(manga.url, originalTitle, date))
         } else {
@@ -261,39 +261,8 @@ abstract class MultiManga : KeiSource() {
         ?.let { DATE_FORMAT.tryParseDateTime(it) }
         ?: 0L
 
-    private fun parseChapterTitle(title: String): ChapterTitleParts {
-        val cleaned = title.trimTrailingParentheses()
-        val marker = findChapterMarker(cleaned) ?: return ChapterTitleParts(null, null, null)
-        val number = marker.groupValues[1].toFloatOrNull() ?: return ChapterTitleParts(null, null, null)
-        // База может быть пустой («- глава 2»): группировать нечего, но имя и номер
-        // главы всё равно нужны одиночной записи.
-        val base = cleaned.substring(0, marker.range.first).trim(*BASE_SEPARATORS).ifEmpty { null }
-        val label = cleaned.substring(marker.range.first).trim(*LABEL_SEPARATORS).ifEmpty { null }
-        return ChapterTitleParts(base, number, label)
-    }
-
-    private fun findChapterMarker(title: String): MatchResult? {
-        val russian = CHAPTER_MARKER_RU.find(title)
-        val english = CHAPTER_MARKER_EN.find(title)
-        return when {
-            russian == null -> english
-            english == null -> russian
-            english.range.first < russian.range.first -> english
-            else -> russian
-        }
-    }
-
-    private fun String.trimTrailingParentheses(): String {
-        var result = trim()
-        while (true) {
-            val next = result.replace(TRAILING_PARENTHESES, "").trim()
-            if (next == result) return result
-            result = next
-        }
-    }
-
     private fun singleChapter(mangaUrl: String, title: String, date: Long): SChapter {
-        val parts = parseChapterTitle(title)
+        val parts = ChapterTitles.parse(title)
         val chapter = chapterFromTitle(title, parts.number ?: 1F, parts.label ?: "Chapter")
         chapter.setUrlWithoutDomain(mangaUrl)
         chapter.date_upload = date
@@ -307,7 +276,7 @@ abstract class MultiManga : KeiSource() {
         number: Float,
         date: Long,
     ): List<SChapter> {
-        val current = chapterFromTitle(title, number, parseChapterTitle(title).label ?: title)
+        val current = chapterFromTitle(title, number, ChapterTitles.parse(title).label ?: title)
         current.setUrlWithoutDomain(mangaUrl)
         // Дату ставим только текущей записи: за датами остальных пришлось бы идти
         // в каждую карточку, а это N лишних запросов.
@@ -320,15 +289,15 @@ abstract class MultiManga : KeiSource() {
     }
 
     private suspend fun searchSeriesChapters(base: String): List<SChapter> {
-        val normalizedBase = normalizeBase(base)
+        val normalizedBase = ChapterTitles.normalizeBase(base)
         val chapters = mutableListOf<SChapter>()
         var page = 1
         var document = fetchDocument(searchUrl(page, base))
         while (true) {
             document.select(CARD_SELECTOR).forEach { element ->
                 val caption = cardTitle(element)
-                val parts = parseChapterTitle(caption)
-                if (parts.base == null || parts.number == null || normalizeBase(parts.base) != normalizedBase) {
+                val parts = ChapterTitles.parse(caption)
+                if (parts.base == null || parts.number == null || ChapterTitles.normalizeBase(parts.base) != normalizedBase) {
                     return@forEach
                 }
                 val href = element.selectFirst("a.cover")?.absUrl("href")?.takeIf { it.isNotBlank() }
@@ -344,12 +313,6 @@ abstract class MultiManga : KeiSource() {
         }
         return chapters
     }
-
-    private fun normalizeBase(value: String): String = value
-        .trim()
-        .lowercase()
-        .replace(WHITESPACE, " ")
-        .trim(' ', '.', ',', ':', ';', '-')
 
     private fun chapterFromTitle(title: String, number: Float, name: String = title): SChapter {
         val chapter = SChapter.create()
@@ -424,24 +387,10 @@ abstract class MultiManga : KeiSource() {
         private const val CHAPTER_SEARCH_MAX_PAGES = 3
         private const val MAX_READER_PAGES = 300
 
-        private val BASE_SEPARATORS = " -–—:|".toCharArray()
-        private val LABEL_SEPARATORS = " -–—:|.,;".toCharArray()
-
         private val DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
-        private val CHAPTER_MARKER_RU =
-            """(?:глава|часть|chapter|part|page|страница|stage)\s*(\d+(?:\.\d+)?)""".toRegex(RegexOption.IGNORE_CASE)
-        private val CHAPTER_MARKER_EN = """(\d+)(?:st|nd|rd|th)?\s*(?:page|part|chapter)""".toRegex(RegexOption.IGNORE_CASE)
-        private val TRAILING_PARENTHESES = """\s*\([^)]*\)\s*$""".toRegex()
-        private val WHITESPACE = """\s+""".toRegex()
         private val PAGE_COUNT = """(\d+)\s*страниц""".toRegex()
     }
 }
-
-private data class ChapterTitleParts(
-    val base: String?,
-    val number: Float?,
-    val label: String?,
-)
 
 /** Сайт недоступен целиком: сеть, DNS, таймаут или сброс соединения. */
 class SiteUnavailableException(message: String, cause: Throwable? = null) : IOException(message, cause)
